@@ -1,0 +1,275 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+
+# Import Data Below
+music <- read_csv('data.csv')
+
+```
+
+
+```{r}
+head(music)
+mod1 = lm(popularity ~ valence, data = music)
+```
+```{r}
+library(modelr)
+grid <- music %>%
+  data_grid(valence)
+grid <- grid %>%
+  add_predictions(mod1)
+grid
+```
+
+```{r}
+library(xgboost)
+modern_music <- music
+## 75% of the sample size
+smp_size <- floor(0.75 * nrow(modern_music))
+
+## set the seed to make your partition reproducible
+set.seed(123)
+train_ind <- sample(seq_len(nrow(modern_music)), size = smp_size)
+
+train <- modern_music[train_ind, ]
+test <- modern_music[-train_ind, ]
+```
+
+```{r}
+#datam = train %>% select(acousticness, danceability, duration_ms, energy, explicit,
+#                         speechiness, valence, year)
+datam = train %>% select(popularity, acousticness, danceability, duration_ms, energy, explicit,
+                         instrumentalness, key, liveness, loudness, mode, speechiness,
+                         tempo, valence)
+```
+
+```{r}
+names(music)
+```
+
+```{r}
+mat <- music %>%
+  select(acousticness, danceability, duration_ms, energy, explicit,
+                         instrumentalness, key, liveness, loudness, mode, speechiness,
+                         tempo, valence, popularity)
+cor(as.matrix(mat))
+```
+
+```{r}
+#bstDense <- xgboost(data = as.matrix(datam), label = train$popularity, max.depth = 8, eta = 0.3, nthread = 2, #nrounds = 16, objective = "reg:squarederror")
+
+#bstDense <- xgboost(data = as.matrix(select(datam, -popularity)), label = train$popularity, max.depth = 8, #eta = 0.1, nthread = 2, nrounds = 256, objective = "reg:squarederror")
+```
+
+```{r}
+library(tidymodels)
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(), min_n = tune(), loss_reduction = tune(),
+  sample_size = tune(), mtry = tune(),
+  learn_rate = tune()
+) %>%
+  set_engine('xgboost') %>%
+  set_mode('regression')
+
+xgb_spec
+```
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), datam),
+  learn_rate(),
+  size = 5
+)
+
+xgb_grid
+```
+
+```{r}
+xgb_wf <- workflow() %>%
+  add_formula(popularity ~ acousticness + danceability + duration_ms +
+                energy + explicit + instrumentalness + key + liveness + loudness
+              + mode + speechiness + tempo + valence) %>%
+  add_model(xgb_spec)
+
+```
+
+```{r}
+set.seed(123)
+folds <- vfold_cv(datam, strata = popularity, v = 5)
+folds
+
+```
+
+```{r}
+library(doParallel)
+doParallel::registerDoParallel()
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+```
+
+```{r}
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == 'rmse') %>%
+  select(mean, mtry:sample_size, .config) %>%
+  pivot_longer(mtry:sample_size,
+               names_to = 'parameter',
+               values_to = 'value') %>%
+  ggplot(aes(value, mean, color = .config)) +
+  geom_point(show.legend = T) + 
+  scale_fill_discrete(name = "Dose") +
+  facet_wrap(~parameter, scales = 'free_x') +
+  ylab('rmse')
+
+```
+
+```{r}
+best_xgb <- select_best(xgb_res, 'rmse')
+best_xgb
+```
+
+```{r}
+final_xgb <- finalize_workflow(xgb_wf, best_xgb)
+final_xgb
+```
+
+```{r}
+library(vip)
+
+final_xgb %>%
+  fit(data = datam) %>%
+  pull_workflow_fit() %>%
+  vip(geom = 'point')
+```
+
+```{r}
+train_test_split <- music %>%
+  select(popularity, acousticness, danceability, duration_ms, energy, explicit,
+                         instrumentalness, key, liveness, loudness, mode, speechiness,
+                         tempo, valence) %>%
+  initial_split()
+final_res <- last_fit(final_xgb, train_test_split)
+final_res %>%
+  collect_metrics()
+```
+
+```{r}
+bstDense <- xgboost(data = as.matrix(select(datam, -popularity)), label = train$popularity, 
+                    mtry = 3, min_n = 14,
+                    max.depth = 11, eta = 0.2, 
+                    loss_reduction = 3.543240e-08, sample_size = 0.255210810420103,
+                    nthread = 2, nrounds = 256, objective = 'reg:squarederror')
+
+#bstDense <- xgboost(data = as.matrix(select(datam, -popularity)), label = train$popularity, 
+#                    mtry = 3, min_n = 14,
+#                    max.depth = 11, eta = 0.2, 
+#                    sample_size = 0.255210810420103,
+#                    nthread = 2, nrounds = 128, objective = 'reg:squarederror')
+```
+
+```{r}
+#data_test = test %>% select(acousticness, danceability, duration_ms, energy, explicit,
+#                         speechiness, valence, year)
+
+data_test = test %>% select(acousticness, danceability, duration_ms, energy, explicit,
+                         instrumentalness, key, liveness, loudness, mode, speechiness,
+                         tempo, valence)
+
+pred <- predict(bstDense, as.matrix(data_test))
+
+res <- abs(test$popularity - pred) %>%
+  as.data.frame()
+ggplot(res) +
+  geom_freqpoly(aes(.)) +
+  xlab('absolute residual')
+
+total <- abs(res) %>%
+  count() %>%
+  as.numeric()
+
+within_5 <- abs(res) %>%
+  filter(. > 5) %>%
+  count() %>%
+  as.numeric()
+
+within_10 <- abs(res) %>%
+  filter(. > 10) %>%
+  count() %>%
+  as.numeric()
+
+within_15 <- abs(res) %>%
+  filter(. > 15) %>%
+  count() %>%
+  as.numeric()
+
+within_25 <- abs(res) %>%
+  filter(. > 25) %>%
+  count() %>%
+  as.numeric()
+
+plus_25 <- abs(res) %>%
+  filter(. < 25) %>%
+  count() %>%
+  as.numeric()
+
+print(1 - (within_5 / total))
+print(1 - (within_10 / total))
+print(1 - (within_15 / total))
+print(1 - (within_25 / total))
+print(1 - (plus_25 / total))
+print(sqrt(mean((test$popularity - pred)^2))) #rmse calculation
+
+```
+
+```{r}
+data_test %>%
+  count()
+
+res %>%
+  filter(. < 15) %>%
+  count()
+
+print(30321 / 43598	)
+```
+
+
+```{r}
+weeknd_songs <- music %>%
+filter(name == "drivers license") %>%
+select(acousticness, danceability, duration_ms, energy, explicit,
+                         instrumentalness, key, liveness, loudness, mode, speechiness,
+                         tempo, valence) %>%
+  as.numeric() %>%
+  as.matrix() %>%
+  t()
+
+predict(bstDense, weeknd_songs)
+music %>%
+  filter(name == 'drivers license') %>%
+  select(popularity) %>%
+  as.numeric()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
